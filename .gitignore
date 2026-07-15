@@ -25,6 +25,7 @@ venv/
 env/
 .env/
 contest_venv/
+/.venv/
 
 # Jupyter
 .ipynb_checkpoints/
@@ -43,3 +44,10 @@ contest_venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local datasets and generated contest artifacts
+/5a_finalproject/LiteTensorDataTest
+/iccad2026contest/results_json/
+/iccad2026contest/images/
+/data/
+/LiteTensorDataTest/

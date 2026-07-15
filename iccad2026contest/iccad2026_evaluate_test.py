@@ -33,6 +33,7 @@ import os
 import random
 import sys
 import time
+from functools import reduce
 from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from pathlib import Path
@@ -57,14 +58,33 @@ from utils import (
 )
 
 try:
+    import shapely
     from shapely.geometry import Polygon, box
     from shapely.ops import unary_union
     SHAPELY_AVAILABLE = True
 except ImportError:
+    shapely = None  # type: ignore[assignment]
     SHAPELY_AVAILABLE = False
     print("WARNING: shapely is not installed. Soft constraint violations "
           "(fixed, preplaced, grouping) will not be computed. "
           "Install it with: pip install shapely>=2.0.0")
+
+
+def _union_geometries(geoms: List) -> Any:
+    """
+    Union a list of shapely geometries.
+
+    shapely.ops.unary_union can raise TypeError on Python 3.13 when disjoint
+  polygons are combined (create_collection ufunc). Pairwise shapely.union works.
+    """
+    if not geoms:
+        raise ValueError("cannot union an empty geometry list")
+    if len(geoms) == 1:
+        return geoms[0]
+    try:
+        return unary_union(geoms)
+    except TypeError:
+        return reduce(shapely.union, geoms)
 
 # =============================================================================
 # CONTEST PARAMETERS (from problem statement)
@@ -617,7 +637,7 @@ def evaluate_solution(
             for g in range(1, n_clust_groups + 1):
                 group_indices = torch.where(clust_const == g)[0].tolist()
                 group_polys = [pred_polys[i] for i in group_indices]
-                union_result = unary_union(group_polys)
+                union_result = _union_geometries(group_polys)
                 if union_result.geom_type == 'MultiPolygon':
                     gv = len(union_result.geoms) - 1
                     grouping_violations += gv
@@ -743,19 +763,24 @@ def evaluate_solution(
 def compute_total_score(costs: List[float], block_counts: List[int]) -> float:
     """
     Compute exponentially weighted average score.
-    
-    Total Score = Σ Cost[i] · e^{n_i} / Σ e^{n_j}
-    
-    where n_i is the block count for test case i. Larger instances
-    contribute exponentially more to the final score.
+
+    Total Score = Σ Cost[i] · e^{n_i/12} / Σ e^{n_j/12}
+
+    where n_i is the block count for test case i. The /12 scaling ensures
+    every size from 21 to 120 carries non-zero weight while still strongly
+    favouring larger instances:
+        exp(n)    → n=120 alone ≈ 63%, cases below n=116 ≈ 1% total
+        exp(n/4)  → n=120 alone ≈ 22%, cases below n=111 ≈ 8% total
+        exp(n/12) → n=120 alone ≈ 34%, cases below n=111 ≈ 28% total
+                    n=21-25 bucket: 0.01% (first option with full-range coverage)
     """
     if not costs:
         return 0.0
     if not block_counts or all(n == 0 for n in block_counts):
         return sum(costs) / len(costs)
-    
+
     max_n = max(block_counts)
-    weights = [math.exp(n - max_n) for n in block_counts]
+    weights = [math.exp((n - max_n) / 12) for n in block_counts]
     total_weight = sum(weights)
     return sum(c * w for c, w in zip(costs, weights)) / total_weight
 
@@ -1081,14 +1106,21 @@ class ContestEvaluator:
                     runtime_seconds=0, cost=M_PENALTY, error=str(e),
                 ))
         
-        # Recompute with median runtime
+        # Local runtime normalization (same as iccad2026_evaluate.py):
+        # RuntimeFactor = 1.0 for every test case (neutral local scoring).
         if runtimes:
-            median_rt = sorted(runtimes)[len(runtimes)//2]
+            if self.verbose:
+                print("\nNOTE: Local runtime scores use RuntimeFactor=1.0 (neutral).")
+                print("      Official scores reflect per-test-case cross-submission medians.")
             for r in results:
                 if r.error is None:
-                    rt_factor = r.runtime_seconds / max(median_rt, 0.01)
-                    r.cost = compute_cost(r.hpwl_gap, r.area_gap, r.violations_relative,
-                                         rt_factor, r.is_feasible)
+                    r.cost = compute_cost(
+                        r.hpwl_gap,
+                        r.area_gap,
+                        r.violations_relative,
+                        1.0,
+                        r.is_feasible,
+                    )
         
         costs = [r.cost for r in results]
         blocks = [r.block_count for r in results]
@@ -1831,6 +1863,32 @@ def visualize_test_case(test_id: int, data_path: str = "../",
 # =============================================================================
 # SCORE SAVED SOLUTIONS
 # =============================================================================
+def _load_solutions_list(data: Dict) -> List[Dict]:
+    """
+    Load solution entries from JSON.
+
+    Accepts:
+      - --save-solutions format: top-level ``solutions`` list
+      - --evaluate format: ``test_results`` with ``positions`` per case
+    """
+    solutions = data.get("solutions", [])
+    if solutions:
+        return solutions
+    out: List[Dict] = []
+    for r in data.get("test_results", []):
+        if r.get("positions") is None:
+            continue
+        out.append(
+            {
+                "test_id": r["test_id"],
+                "block_count": r["block_count"],
+                "positions": r["positions"],
+                "runtime_seconds": float(r.get("runtime_seconds", 0.0)),
+            }
+        )
+    return out
+
+
 def score_saved_solutions(
     solutions_path: str,
     data_path: str = "../",
@@ -1840,7 +1898,8 @@ def score_saved_solutions(
     Re-score saved solutions without re-running the optimizer.
     
     Args:
-        solutions_path: Path to solutions JSON (from --save-solutions)
+        solutions_path: Path to solutions JSON (from --save-solutions or
+            *_results.json from --evaluate with positions)
         data_path: Path to FloorSet data
         output_path: Output file path (optional)
     
@@ -1854,8 +1913,20 @@ def score_saved_solutions(
     with open(solutions_path) as f:
         data = json.load(f)
     
-    solutions = data.get('solutions', [])
+    solutions = _load_solutions_list(data)
     print(f"Loaded {len(solutions)} solutions")
+    if not solutions:
+        print(
+            "Error: no solutions found. Expected JSON with 'solutions' "
+            "(from --save-solutions) or 'test_results' with positions "
+            "(from --evaluate)."
+        )
+        return {
+            "source": solutions_path,
+            "timestamp": datetime.now().isoformat(),
+            "total_score": 0.0,
+            "results": [],
+        }
     
     # Load test dataset
     dataset = FloorplanDatasetLiteTest(data_path)
@@ -1898,6 +1969,8 @@ def score_saved_solutions(
             if metrics[-2] > 0 and metrics[-1] >= 0:
                 hpwl_baseline = float(metrics[-2]) + float(metrics[-1])
         
+        runtime = float(sol.get("runtime_seconds", 0.0))
+
         # Evaluate the saved solution
         solution_metrics = evaluate_solution(
             {'positions': positions, 'runtime': 1.0},
@@ -1917,12 +1990,24 @@ def score_saved_solutions(
             'is_feasible': solution_metrics.is_feasible,
             'hpwl_gap': solution_metrics.hpwl_gap,
             'area_gap': solution_metrics.area_gap,
+            'violations_relative': solution_metrics.violations_relative,
             'cost': solution_metrics.cost,
             'hpwl_total': solution_metrics.hpwl_total,
             'bbox_area': solution_metrics.bbox_area,
             'overlaps': solution_metrics.overlap_violations,
-            'area_violations': solution_metrics.area_violations
+            'area_violations': solution_metrics.area_violations,
+            'runtime_seconds': runtime,
         })
+
+    # Neutral runtime scoring (same as iccad2026_evaluate.py evaluate/score paths).
+    for r in results:
+        r['cost'] = compute_cost(
+            r['hpwl_gap'],
+            r['area_gap'],
+            r['violations_relative'],
+            1.0,
+            r['is_feasible'],
+        )
     
     # Compute total score
     costs = [r['cost'] for r in results]
@@ -1936,7 +2021,15 @@ def score_saved_solutions(
     print(f"\nTotal Score: {total_score:.4f}")
     print(f"Tests: {len(results)}")
     print(f"Feasible: {sum(1 for r in results if r['is_feasible'])}")
-    print(f"Avg Cost: {sum(costs)/len(costs):.4f}")
+    if costs:
+        print(f"Avg Cost: {sum(costs)/len(costs):.4f}")
+    else:
+        print("Avg Cost: N/A")
+    runtimes = [r['runtime_seconds'] for r in results if r['runtime_seconds'] > 0]
+    if runtimes:
+        print(f"Avg Runtime: {sum(runtimes) / len(runtimes):.2f}s")
+    else:
+        print("Avg Runtime: N/A")
     
     output = {
         'source': solutions_path,
